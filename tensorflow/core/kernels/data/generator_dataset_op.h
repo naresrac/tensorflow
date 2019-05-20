@@ -20,6 +20,7 @@ limitations under the License.
 #include "tensorflow/core/kernels/data/captured_function.h"
 
 namespace tensorflow {
+namespace data {
 
 class GeneratorDatasetOp : public DatasetOpKernel {
  public:
@@ -32,10 +33,11 @@ class GeneratorDatasetOp : public DatasetOpKernel {
 
   DataTypeVector output_types_;
   std::vector<PartialTensorShape> output_shapes_;
-  NameAttrList init_func_;
-  NameAttrList next_func_;
-  NameAttrList finalize_func_;
+  std::shared_ptr<FunctionMetadata> init_func_metadata_ = nullptr;
+  std::shared_ptr<FunctionMetadata> next_func_metadata_ = nullptr;
+  std::shared_ptr<FunctionMetadata> finalize_func_metadata_ = nullptr;
 };
 
+}  // namespace data
 }  // namespace tensorflow
 #endif  // TENSORFLOW_CORE_KERNELS_DATA_GENERATOR_DATASET_OP_H_

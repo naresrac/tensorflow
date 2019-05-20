@@ -40,14 +40,15 @@ class GenericTransferManager : public TransferManager {
 
   se::Platform::Id PlatformId() const override;
 
-  void TransferLiteralFromDevice(se::Stream* stream,
-                                 const ShapedBuffer& device_buffer,
-                                 MutableBorrowingLiteral literal,
-                                 std::function<void(Status)> done) override;
+  void TransferLiteralFromDevice(
+      se::Stream* stream, const ShapedBuffer& device_buffer,
+      MutableBorrowingLiteral literal, std::function<void(Status)> done,
+      const TransferMetadata* transfer_metadata) override;
 
   Status TransferLiteralToDeviceAsync(
       se::Stream* stream, const LiteralSlice& literal,
-      const ShapedBuffer& device_buffer) override;
+      const ShapedBuffer& device_buffer,
+      const TransferMetadata* transfer_metadata) override;
 
   Status TransferLiteralToInfeed(se::StreamExecutor* executor,
                                  const LiteralSlice& literal) override;
@@ -55,15 +56,13 @@ class GenericTransferManager : public TransferManager {
                                     const Shape& literal_shape,
                                     MutableBorrowingLiteral literal) override;
 
-  Status ResetDevices(
-      tensorflow::gtl::ArraySlice<se::StreamExecutor*> executors) override;
+  Status ResetDevices(absl::Span<se::StreamExecutor* const> executors) override;
 
   int64 GetByteSizeRequirement(const Shape& shape) const override;
 
  protected:
   Status WriteSingleTupleIndexTable(
-      se::Stream* stream,
-      tensorflow::gtl::ArraySlice<se::DeviceMemoryBase> elements,
+      se::Stream* stream, absl::Span<const se::DeviceMemoryBase> elements,
       const Shape& shape, se::DeviceMemoryBase* region) override;
 
  private:

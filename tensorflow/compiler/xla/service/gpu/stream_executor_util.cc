@@ -15,7 +15,18 @@ limitations under the License.
 
 #include "tensorflow/compiler/xla/service/gpu/stream_executor_util.h"
 
+#include "absl/memory/memory.h"
 #include "tensorflow/compiler/xla/layout_util.h"
+#include "tensorflow/compiler/xla/service/hlo_instruction.h"
+#include "tensorflow/compiler/xla/util.h"
+#include "tensorflow/core/lib/gtl/cleanup.h"
+#include "tensorflow/core/lib/io/path.h"
+#include "tensorflow/core/platform/cuda_libdevice_path.h"
+#include "tensorflow/core/platform/regexp.h"
+#include "tensorflow/core/platform/subprocess.h"
+#include "tensorflow/core/platform/tracing.h"
+#include "tensorflow/core/profiler/lib/traceme.h"
+#include "tensorflow/stream_executor/kernel_spec.h"
 
 namespace xla {
 namespace gpu {
@@ -53,8 +64,9 @@ StreamExecutorConvLayoutsToXlaLayouts(const ConvolutionDimensionNumbers& dnums,
       input_layout.push_back(dnums.input_feature_dimension());
       break;
     default:
-      return tensorflow::errors::Internal("Invalid input layout: ",
-                                          DataLayoutString(input));
+      return InternalError("Invalid input layout %s for conv with dnums %s",
+                           DataLayoutString(input),
+                           ConvolutionDimensionNumbersToString(dnums));
   }
 
   std::vector<int64> filter_layout;
@@ -74,8 +86,9 @@ StreamExecutorConvLayoutsToXlaLayouts(const ConvolutionDimensionNumbers& dnums,
       filter_layout.push_back(dnums.kernel_input_feature_dimension());
       break;
     default:
-      return tensorflow::errors::Internal("Invalid filter layout: ",
-                                          FilterLayoutString(filter));
+      return InternalError("Invalid filter layout %s for conv with dnums %s",
+                           FilterLayoutString(filter),
+                           ConvolutionDimensionNumbersToString(dnums));
   }
 
   std::vector<int64> output_layout;
@@ -95,8 +108,9 @@ StreamExecutorConvLayoutsToXlaLayouts(const ConvolutionDimensionNumbers& dnums,
       output_layout.push_back(dnums.output_feature_dimension());
       break;
     default:
-      return tensorflow::errors::Internal("Invalid output layout: ",
-                                          DataLayoutString(output));
+      return InternalError("Invalid output layout %s for conv with dnums %s",
+                           DataLayoutString(output),
+                           ConvolutionDimensionNumbersToString(dnums));
   }
 
   return std::make_tuple(LayoutUtil::MakeLayoutFromMajorToMinor(input_layout),
@@ -128,8 +142,9 @@ XlaConvLayoutsToStreamExecutorLayouts(const ConvolutionDimensionNumbers& dnums,
   } else if (LayoutUtil::Equal(input, nhwc_input)) {
     input_layout = DataLayout::kBatchYXDepth;
   } else {
-    return tensorflow::errors::Internal("Invalid input layout: ",
-                                        input.ShortDebugString());
+    return InternalError("Invalid input layout %s for conv with dnums %s",
+                         LayoutUtil::HumanString(input),
+                         ConvolutionDimensionNumbersToString(dnums));
   }
 
   FilterLayout filter_layout;
@@ -138,8 +153,9 @@ XlaConvLayoutsToStreamExecutorLayouts(const ConvolutionDimensionNumbers& dnums,
   } else if (LayoutUtil::Equal(filter, nhwc_filter)) {
     filter_layout = FilterLayout::kOutputYXInput;
   } else {
-    return tensorflow::errors::Internal("Invalid filter layout: ",
-                                        filter.ShortDebugString());
+    return InternalError("Invalid filter layout %s for conv with dnums %s",
+                         LayoutUtil::HumanString(filter),
+                         ConvolutionDimensionNumbersToString(dnums));
   }
 
   DataLayout output_layout;
@@ -148,11 +164,74 @@ XlaConvLayoutsToStreamExecutorLayouts(const ConvolutionDimensionNumbers& dnums,
   } else if (LayoutUtil::Equal(output, nhwc_output)) {
     output_layout = DataLayout::kBatchYXDepth;
   } else {
-    return tensorflow::errors::Internal("Invalid output layout: ",
-                                        output.ShortDebugString());
+    return InternalError("Invalid output layout %s for conv with dnums %s",
+                         LayoutUtil::HumanString(output),
+                         ConvolutionDimensionNumbersToString(dnums));
   }
 
   return std::make_tuple(input_layout, filter_layout, output_layout);
 }
+
+tensorflow::mutex_lock LockGpu(const se::StreamExecutor* stream_exec) {
+  static tensorflow::mutex mu(tensorflow::LINKER_INITIALIZED);
+  // se::Platform*s are global singletons guaranteed to live forever.
+  static auto* mutexes =
+      new std::map<std::pair<const se::Platform*, /*device_ordinal*/ int64>,
+                   tensorflow::mutex>();
+
+  tensorflow::mutex_lock global_lock(mu);
+  auto it = mutexes
+                ->emplace(std::piecewise_construct,
+                          std::make_tuple(stream_exec->platform(),
+                                          stream_exec->device_ordinal()),
+                          std::make_tuple())
+                .first;
+  return tensorflow::mutex_lock{it->second};
+}
+
+StatusOr<std::unique_ptr<se::KernelBase>> CreateKernel(
+    absl::string_view kernel_name, uint64 num_args, absl::string_view ptx,
+    absl::Span<const uint8> cubin_data, se::StreamExecutor* stream_exec) {
+  se::MultiKernelLoaderSpec loader_spec(num_args);
+  loader_spec.AddCudaPtxInMemory(ptx, kernel_name);
+
+  if (!cubin_data.empty()) {
+    loader_spec.AddCudaCubinInMemory(
+        reinterpret_cast<const char*>(cubin_data.data()), kernel_name);
+  }
+
+  auto kernel_base = absl::make_unique<se::KernelBase>(stream_exec);
+  if (!stream_exec->GetKernel(loader_spec, kernel_base.get())) {
+    return InternalError("Unable to load kernel '%s'", kernel_name);
+  }
+
+  return std::move(kernel_base);
+}
+
+Status ExecuteKernelOnStream(const se::KernelBase& kernel,
+                             absl::Span<const se::DeviceMemoryBase> args,
+                             int64 threads_per_block, int64 block_count,
+                             se::Stream* stream) {
+  static constexpr int kKernelArgsLimit = 1024;
+  auto kernel_args = absl::make_unique<se::KernelArgsArray<kKernelArgsLimit>>();
+  for (const se::DeviceMemoryBase& buf : args) {
+    kernel_args->add_device_memory_argument(buf);
+  }
+
+  if (!stream->parent()->Launch(stream, se::ThreadDim(threads_per_block),
+                                se::BlockDim(block_count), kernel,
+                                *kernel_args)) {
+    return InternalError("Unable to launch kernel");
+  }
+  return Status::OK();
+}
+
+se::cuda::PtxCompilationOptions PtxOptsFromConfig(
+    const HloModuleConfig& hlo_module_config) {
+  return se::cuda::PtxCompilationOptions(
+      hlo_module_config.debug_options().xla_gpu_disable_ptxas_optimizations(),
+      hlo_module_config.debug_options().xla_gpu_cuda_data_dir());
+}
+
 }  // namespace gpu
 }  // namespace xla

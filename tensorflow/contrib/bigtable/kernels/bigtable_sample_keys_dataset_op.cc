@@ -17,6 +17,7 @@ limitations under the License.
 #include "tensorflow/core/framework/op_kernel.h"
 
 namespace tensorflow {
+namespace data {
 namespace {
 
 class BigtableSampleKeysDatasetOp : public DatasetOpKernel {
@@ -27,6 +28,7 @@ class BigtableSampleKeysDatasetOp : public DatasetOpKernel {
     BigtableTableResource* resource;
     OP_REQUIRES_OK(ctx,
                    LookupResource(ctx, HandleFromInput(ctx, 0), &resource));
+    core::ScopedUnref scoped_unref(resource);
     *output = new Dataset(ctx, resource);
   }
 
@@ -78,12 +80,14 @@ class BigtableSampleKeysDatasetOp : public DatasetOpKernel {
           : DatasetIterator<Dataset>(params) {}
 
       Status Initialize(IteratorContext* ctx) override {
-        ::grpc::Status status;
-        row_keys_ = dataset()->table()->table().SampleRows(status);
-        if (!status.ok()) {
+        ::google::cloud::StatusOr<
+            std::vector<::google::cloud::bigtable::RowKeySample>>
+            sampled_rows = dataset()->table()->table().SampleRows();
+        if (!sampled_rows.ok()) {
           row_keys_.clear();
-          return GrpcStatusToTfStatus(status);
+          return GcpStatusToTfStatus(sampled_rows.status());
         }
+        row_keys_ = std::move(*sampled_rows);
         return Status::OK();
       }
 
@@ -118,4 +122,5 @@ REGISTER_KERNEL_BUILDER(Name("BigtableSampleKeysDataset").Device(DEVICE_CPU),
                         BigtableSampleKeysDatasetOp);
 
 }  // namespace
+}  // namespace data
 }  // namespace tensorflow

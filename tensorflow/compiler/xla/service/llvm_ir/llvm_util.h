@@ -20,8 +20,11 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
@@ -32,8 +35,6 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/hlo_module_config.h"
 #include "tensorflow/compiler/xla/types.h"
 #include "tensorflow/compiler/xla/xla_data.pb.h"
-#include "tensorflow/core/lib/core/stringpiece.h"
-#include "tensorflow/core/lib/gtl/array_slice.h"
 #include "tensorflow/core/platform/types.h"
 
 namespace llvm {
@@ -44,14 +45,13 @@ class TargetOptions;
 namespace xla {
 namespace llvm_ir {
 
-// Convert a std::string (used by LLVM's interfaces) to string.
-string AsString(const std::string& str);
-
-// Convert a tensorflow::StringPiece to a llvm::StringRef. Note: both
-// tensorflow::StringPiece and llvm::StringRef are non-owning pointers into a
+// Convert a absl::string_view to a llvm::StringRef. Note: both
+// absl::string_view and llvm::StringRef are non-owning pointers into a
 // string in memory. This method is used to feed strings to LLVM
 // & Clang APIs that expect llvm::StringRef.
-llvm::StringRef AsStringRef(tensorflow::StringPiece str);
+inline llvm::StringRef AsStringRef(absl::string_view str) {
+  return llvm::StringRef(str.data(), str.size());
+}
 
 template <typename T>
 llvm::ArrayRef<T> AsArrayRef(const std::vector<T>& vec) {
@@ -59,7 +59,7 @@ llvm::ArrayRef<T> AsArrayRef(const std::vector<T>& vec) {
 }
 
 template <typename T>
-llvm::ArrayRef<T> AsArrayRef(const tensorflow::gtl::ArraySlice<T>& slice) {
+llvm::ArrayRef<T> AsArrayRef(const absl::Span<const T>& slice) {
   return llvm::ArrayRef<T>(slice.data(), slice.size());
 }
 
@@ -70,7 +70,7 @@ string DumpToString(const T& entity) {
   llvm::raw_string_ostream ostream(buffer_string);
   entity.print(ostream);
   ostream.flush();
-  return AsString(buffer_string);
+  return buffer_string;
 }
 
 // Dump the given LLVM module to a string. This requires a function distinct
@@ -88,8 +88,8 @@ string DumpModuleToString(const llvm::Module& module);
 //   - removing all '%'s.
 //
 string IrName(string a);
-string IrName(tensorflow::StringPiece a, tensorflow::StringPiece b);
-string IrName(const HloInstruction* a, tensorflow::StringPiece b = "");
+string IrName(absl::string_view a, absl::string_view b);
+string IrName(const HloInstruction* a, absl::string_view b = "");
 
 // Removes special characters from a function name.
 //
@@ -101,11 +101,9 @@ string SanitizeFunctionName(string function_name);
 // intrinsics (for example, "minnum") must include a type in overloaded_types
 // for each overloaded type. Typically, overloaded intrinsics have only a single
 // overloaded type.
-llvm::Value* EmitCallToIntrinsic(
-    llvm::Intrinsic::ID intrinsic_id,
-    tensorflow::gtl::ArraySlice<llvm::Value*> operands,
-    tensorflow::gtl::ArraySlice<llvm::Type*> overloaded_types,
-    llvm::IRBuilder<>* b);
+llvm::CallInst* EmitCallToIntrinsic(
+    llvm::Intrinsic::ID intrinsic_id, absl::Span<llvm::Value* const> operands,
+    absl::Span<llvm::Type* const> overloaded_types, llvm::IRBuilder<>* b);
 
 // Emit float max. Emit maxnum intrinsic is fast math is disabled, or
 // fcmp+select otherwise
@@ -156,6 +154,11 @@ StatusOr<Shape> DecodeSelfDescribingShapeConstant(const void* shape_ptr,
 llvm::Constant* ConvertLiteralToIrConstant(const Literal& literal,
                                            llvm::Module* module);
 
+// Allocates a tile of shared memory.
+llvm::GlobalVariable* AllocateSharedMemoryTile(llvm::Module* module,
+                                               llvm::Type* tile_type,
+                                               absl::string_view name);
+
 // Inserts an allocate of the requested type at the entry point of the
 // function that the builder is currently building. The insert point
 // of the builder is set to the same place after calling this function
@@ -164,21 +167,23 @@ llvm::Constant* ConvertLiteralToIrConstant(const Literal& literal,
 // This can be useful to avoid e.g. executing an alloca every time
 // through a loop.
 llvm::AllocaInst* EmitAllocaAtFunctionEntry(llvm::Type* type,
-                                            tensorflow::StringPiece name,
+                                            absl::string_view name,
                                             llvm::IRBuilder<>* b,
                                             int alignment = 0);
 
 // As EmitAllocaAtFunctionEntry, but allocates element_count entries
 // instead of a single element.
-llvm::AllocaInst* EmitAllocaAtFunctionEntryWithCount(
-    llvm::Type* type, llvm::Value* element_count, tensorflow::StringPiece name,
-    llvm::IRBuilder<>* b, int alignment = 0);
+llvm::AllocaInst* EmitAllocaAtFunctionEntryWithCount(llvm::Type* type,
+                                                     llvm::Value* element_count,
+                                                     absl::string_view name,
+                                                     llvm::IRBuilder<>* b,
+                                                     int alignment = 0);
 
 // Creates a basic block with the same context and function as for the
 // builder. Inserts at the end of the function if insert_before is
 // null.
 llvm::BasicBlock* CreateBasicBlock(llvm::BasicBlock* insert_before,
-                                   tensorflow::StringPiece name,
+                                   absl::string_view name,
                                    llvm::IRBuilder<>* b);
 
 // Struct with data on a conditional branch in a diamond shape created
@@ -210,7 +215,7 @@ struct LlvmIfData {
 // Currently the insertion point of the builder must be a well-formed
 // block with a terminator. If you need to use this for a
 // non-terminated block, just make the function able to do that too.
-LlvmIfData EmitIfThenElse(llvm::Value* condition, tensorflow::StringPiece name,
+LlvmIfData EmitIfThenElse(llvm::Value* condition, absl::string_view name,
                           llvm::IRBuilder<>* b, bool emit_else = true);
 
 // Emits a compare operation between "lhs" and "rhs" with the given predicate,
@@ -258,12 +263,7 @@ int64 ByteSizeOf(const Shape& shape, const llvm::DataLayout& data_layout);
 
 // Gets an llvm::FastMathFlags that reflects the settings in the given
 // module config.
-llvm::FastMathFlags GetFastMathFlags(bool fast_math_enabled);
-
-// Sets values in the given TargetOptions struct according to the given
-// compilation options.
-void SetTargetOptions(bool fast_math_enabled,
-                      llvm::TargetOptions* target_options);
+llvm::FastMathFlags GetCpuFastMathFlags(const HloModuleConfig& module_config);
 
 // Computes a conservative union of the metadata in "a" and "b".  For
 // aliasing-related metadata, this means the result can be applied to
@@ -273,20 +273,19 @@ std::map<int, llvm::MDNode*> MergeMetadata(
     llvm::LLVMContext* context, const std::map<int, llvm::MDNode*>& a,
     const std::map<int, llvm::MDNode*>& b);
 
-// Dumps out `llvm_module` to a file in the directory named `directory_name`,
-// creating the directory if necessary.  A sanitized version of
-// `hlo_module_name` is incorporated into the file name.  If `optimized` is true
-// then a suffix of "-with-opt.ll" is used, else a suffix of "-no-opt.ll" is
-// used.
-Status DumpIRToDirectory(const string& directory_name,
-                         const string& hlo_module_name,
-                         const llvm::Module& llvm_module, bool optimized);
+// Dumps out `llvm_module` to the path specified in DebugOptions, if dumping is
+// enabled for the given HLO module.
+//
+// A sanitized version of `hlo_module_name` is incorporated into the file name.
+// If `optimized` is true then a suffix of "-with-opt.ll" is used, else a suffix
+// of "-no-opt.ll" is used.
+void DumpIrIfEnabled(const HloModule& hlo_module,
+                     const llvm::Module& llvm_module, bool optimized);
 
-llvm::Function* CreateFunction(llvm::FunctionType* function_type,
-                               llvm::GlobalValue::LinkageTypes linkage,
-                               bool enable_fast_math, bool optimize_for_size,
-                               tensorflow::StringPiece name,
-                               llvm::Module* module);
+llvm::Function* CreateCpuFunction(llvm::FunctionType* function_type,
+                                  llvm::GlobalValue::LinkageTypes linkage,
+                                  const HloModuleConfig& module_config,
+                                  absl::string_view name, llvm::Module* module);
 
 // Extracts the xla_backend_extra_options from `config` and passes those that
 // don't start with xla_ to LLVM.

@@ -18,6 +18,7 @@ limitations under the License.
 #include "tensorflow/core/framework/op_kernel.h"
 
 namespace tensorflow {
+namespace data {
 namespace {
 
 class BigtableSampleKeyPairsDatasetOp : public DatasetOpKernel {
@@ -37,6 +38,7 @@ class BigtableSampleKeyPairsDatasetOp : public DatasetOpKernel {
     BigtableTableResource* resource;
     OP_REQUIRES_OK(ctx,
                    LookupResource(ctx, HandleFromInput(ctx, 0), &resource));
+    core::ScopedUnref scoped_unref(resource);
 
     OP_REQUIRES(ctx, prefix.empty() || start_key.empty(),
                 errors::InvalidArgument(
@@ -123,15 +125,15 @@ class BigtableSampleKeyPairsDatasetOp : public DatasetOpKernel {
       // ensure we don't accidentally miss any subsets of the requested range by
       // including `begin_key()` and `end_key()` as appropriate.
       Status Initialize(IteratorContext* ctx) override {
-        grpc::Status status;
-        std::vector<google::cloud::bigtable::RowKeySample> row_keys =
-            dataset()->table().table().SampleRows(status);
-        if (!status.ok()) {
-          return GrpcStatusToTfStatus(status);
+        ::google::cloud::StatusOr<
+            std::vector<::google::cloud::bigtable::RowKeySample>>
+            row_key_samples = dataset()->table().table().SampleRows();
+        if (!row_key_samples.ok()) {
+          return GcpStatusToTfStatus(row_key_samples.status());
         }
 
-        for (size_t i = 0; i < row_keys.size(); ++i) {
-          string row_key(row_keys[i].row_key);
+        for (const auto& row_key_sample : *row_key_samples) {
+          string row_key(row_key_sample.row_key);
           if (dataset()->key_range_.contains_key(row_key)) {
             // First key: check to see if we need to add the begin_key.
             if (keys_.empty() && dataset()->key_range_.begin_key() != row_key) {
@@ -165,7 +167,7 @@ class BigtableSampleKeyPairsDatasetOp : public DatasetOpKernel {
                              std::vector<Tensor>* out_tensors,
                              bool* end_of_sequence) override {
         mutex_lock l(mu_);
-        if (index_ > keys_.size() - 2) {
+        if (index_ + 2 > keys_.size()) {
           *end_of_sequence = true;
           return Status::OK();
         }
@@ -205,4 +207,5 @@ REGISTER_KERNEL_BUILDER(
     BigtableSampleKeyPairsDatasetOp);
 
 }  // namespace
+}  // namespace data
 }  // namespace tensorflow

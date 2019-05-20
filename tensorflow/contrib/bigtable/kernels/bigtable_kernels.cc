@@ -14,12 +14,10 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/contrib/bigtable/kernels/bigtable_lib.h"
-
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/lib/core/threadpool.h"
 
 namespace tensorflow {
-
 namespace {
 
 class BigtableClientOp : public OpKernel {
@@ -172,6 +170,11 @@ class BigtableTableOp : public OpKernel {
 REGISTER_KERNEL_BUILDER(Name("BigtableTable").Device(DEVICE_CPU),
                         BigtableTableOp);
 
+}  // namespace
+
+namespace data {
+namespace {
+
 class ToBigtableOp : public AsyncOpKernel {
  public:
   explicit ToBigtableOp(OpKernelConstruction* ctx)
@@ -258,32 +261,31 @@ class ToBigtableOp : public AsyncOpKernel {
           }
           components.clear();
         }
-        grpc::Status mutation_status;
+        ::google::cloud::Status mutation_status;
         std::vector<::google::cloud::bigtable::FailedMutation> failures =
-            resource->table().BulkApply(std::move(mutation), mutation_status);
-        if (!mutation_status.ok()) {
-          LOG(ERROR) << "Failure applying mutation: "
-                     << mutation_status.error_code() << " - "
-                     << mutation_status.error_message() << " ("
-                     << mutation_status.error_details() << ").";
-        }
+            resource->table().BulkApply(mutation);
         if (!failures.empty()) {
+          mutation_status = failures.front().status();
+          if (!mutation_status.ok()) {
+            LOG(ERROR) << "Failure applying mutation: "
+                       << mutation_status.code() << " - "
+                       << mutation_status.message() << ".";
+          }
+          ::google::bigtable::v2::MutateRowsRequest request;
+          mutation.MoveTo(&request);
           for (const auto& failure : failures) {
             LOG(ERROR) << "Failure applying mutation on row ("
-                       << failure.original_index()
-                       << "): " << failure.mutation().row_key()
-                       << " - error: " << failure.status().error_message()
-                       << " (Details: " << failure.status().error_details()
-                       << ").";
+                       << failure.original_index() << "): "
+                       << request.entries(failure.original_index()).row_key()
+                       << " - error: " << failure.status().message() << ".";
           }
         }
         OP_REQUIRES_ASYNC(
-            ctx, failures.empty() && mutation_status.ok(),
+            ctx, failures.empty(),
             errors::Unknown("Failure while writing to Cloud Bigtable: ",
-                            mutation_status.error_code(), " - ",
-                            mutation_status.error_message(), " (",
-                            mutation_status.error_details(),
-                            "), # of mutation failures: ", failures.size(),
+                            mutation_status.code(), " - ",
+                            mutation_status.message(),
+                            "; # of mutation failures: ", failures.size(),
                             ". See the log for the specific error details."),
             done);
       } while (!end_of_sequence);
@@ -336,8 +338,8 @@ class ToBigtableOp : public AsyncOpKernel {
   }
 
   template <typename T>
-  Status ParseScalarArgument(OpKernelContext* ctx,
-                             const StringPiece& argument_name, T* output) {
+  Status ParseScalarArgument(OpKernelContext* ctx, StringPiece argument_name,
+                             T* output) {
     const Tensor* argument_t;
     TF_RETURN_IF_ERROR(ctx->input(argument_name, &argument_t));
     if (!TensorShapeUtils::IsScalar(argument_t->shape())) {
@@ -354,5 +356,5 @@ REGISTER_KERNEL_BUILDER(Name("DatasetToBigtable").Device(DEVICE_CPU),
                         ToBigtableOp);
 
 }  // namespace
-
+}  // namespace data
 }  // namespace tensorflow
